@@ -341,6 +341,16 @@ class HttpResponseNotFound(HttpResponse):
 #
 #     return data
 
+def index(environ, *args, **kwargs):
+    print('<h1>root path</h1>')
+
+def show_path(environ, *args, **kwargs):
+    print('<p>get path1 information</p>')
+
+url_patterns = [
+    ('^/$', index),
+    ('^/path[1,2]$', show_path)
+]
 
 def application(environ, start_response):
     response = path_to_response(environ)
