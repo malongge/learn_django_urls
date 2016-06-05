@@ -1,624 +1,311 @@
 深入理解 django 的 urls 的实现 （二）
 ===================================
 
-通过方法来处理 path 并返回处理后的数据
+通过函数来处理 path 并返回处理后的数据
 ------------------------------------
 
-  首先我将 url path 与它的处理方法对应起来， path 匹配的方式都采用正则表达式来做， 然后我将这些 URL 资源定位
-相关的数据也告诉处理方法。
+  首先我将 url path 与它的处理函数对应起来， path 匹配的方式都采用正则表达式来做， 然后我将这些 URL 资源定位
+相关的数据也告诉处理函数。
 
-url_patterns
+在这之前，我需要了解一点正则表达式知识， 比如在路径里面需要将变量扩起来是为了进行分组，这样不但匹配了路径还可以提取匹配模式的内容，
+另外路径中使用?P<alias name>这样的模式除了分组之外，还给每个组取了个别名，这样就可以像字典一样找到对应的匹配内容了
 
-
+下面对应着，不分组，分组，分组取别名的情况
+```
+    
+    >>> import re
+    
+    >>> pat = re.compile('^/path[1,2]$')
+    >>> pat.search('/path1').groups()
+    ()
+    
+    >>> pat = re.compile('^/path([1,2])$')
+    >>> pat.search('/path1').groups()
+    ('1',)
+    
+    >>>pat = re.compile('^/path(?P<num>[1,2])$')
+    >>> pat.search('/path1').groupdict()
+    {'num': '1'}
 
 ```
 
-    import socket
-    import socketserver
-    
-    from wsgiref import simple_server
-    from django.utils.encoding import uri_to_iri
-    from django.core.management.color import color_style
-    from django.core.handlers.wsgi import ISO_8859_1, UTF_8
-    from django.utils import six
-    
-    
-    def is_broken_pipe_error():
-        exc_type, exc_value = sys.exc_info()[:2]
-        return issubclass(exc_type, socket.error) and exc_value.args[0] == 32
-    
-    
-    class ServerHandler(simple_server.ServerHandler, object):
-        def handle_error(self):
-            # Ignore broken pipe errors, otherwise pass on
-            if not is_broken_pipe_error():
-                super(ServerHandler, self).handle_error()
-    
-    
-    class WSGIServer(simple_server.WSGIServer, object):
-        """BaseHTTPServer that implements the Python WSGI protocol"""
-    
-        request_queue_size = 10
-    
-        def __init__(self, *args, **kwargs):
-            if kwargs.pop('ipv6', False):
-                self.address_family = socket.AF_INET6
-            super(WSGIServer, self).__init__(*args, **kwargs)
-    
-        def server_bind(self):
-            """Override server_bind to store the server name."""
-            super(WSGIServer, self).server_bind()
-            self.setup_environ()
-    
-        def handle_error(self, request, client_address):
-            if is_broken_pipe_error():
-                sys.stderr.write("- Broken pipe from %s\n" % (client_address,))
-            else:
-                super(WSGIServer, self).handle_error(request, client_address)
-                
-                
-    class WSGIRequestHandler(simple_server.WSGIRequestHandler, object):
-    
-        def __init__(self, *args, **kwargs):
-            self.style = color_style()
-            super(WSGIRequestHandler, self).__init__(*args, **kwargs)
-    
-        def address_string(self):
-            # Short-circuit parent method to not call socket.getfqdn
-            return self.client_address[0]
-    
-        def log_message(self, format, *args):
-    
-            msg = "[%s]" % self.log_date_time_string()
-            try:
-                msg += "%s\n" % (format % args)
-            except UnicodeDecodeError:
-                # e.g. accessing the server via SSL on Python 2
-                msg += "\n"
-    
-            # Utilize terminal colors, if available
-            if args[1][0] == '2':
-                # Put 2XX first, since it should be the common case
-                msg = self.style.HTTP_SUCCESS(msg)
-            elif args[1][0] == '1':
-                msg = self.style.HTTP_INFO(msg)
-            elif args[1] == '304':
-                msg = self.style.HTTP_NOT_MODIFIED(msg)
-            elif args[1][0] == '3':
-                msg = self.style.HTTP_REDIRECT(msg)
-            elif args[1] == '404':
-                msg = self.style.HTTP_NOT_FOUND(msg)
-            elif args[1][0] == '4':
-                # 0x16 = Handshake, 0x03 = SSL 3.0 or TLS 1.x
-                if args[0].startswith(str('\x16\x03')):
-                    msg = ("You're accessing the development server over HTTPS, "
-                        "but it only supports HTTP.\n")
-                msg = self.style.HTTP_BAD_REQUEST(msg)
-            else:
-                # Any 5XX, or any other response
-                msg = self.style.HTTP_SERVER_ERROR(msg)
-    
-            sys.stderr.write(msg)
-    
-        def get_environ(self):
-            # Strip all headers with underscores in the name before constructing
-            # the WSGI environ. This prevents header-spoofing based on ambiguity
-            # between underscores and dashes both normalized to underscores in WSGI
-            # env vars. Nginx and Apache 2.4+ both do this as well.
-            for k, v in self.headers.items():
-                if '_' in k:
-                    del self.headers[k]
-    
-            env = super(WSGIRequestHandler, self).get_environ()
-    
-            path = self.path
-            if '?' in path:
-                path = path.partition('?')[0]
-    
-            path = uri_to_iri(path).encode(UTF_8)
-            # Under Python 3, non-ASCII values in the WSGI environ are arbitrarily
-            # decoded with ISO-8859-1. We replicate this behavior here.
-            # Refs comment in `get_bytes_from_wsgi()`.
-            env['PATH_INFO'] = path.decode(ISO_8859_1) if six.PY3 else path
-    
-            return env
-    
-        def handle(self):
-            """Copy of WSGIRequestHandler, but with different ServerHandler"""
-    
-            self.raw_requestline = self.rfile.readline(65537)
-            if len(self.raw_requestline) > 65536:
-                self.requestline = ''
-                self.request_version = ''
-                self.command = ''
-                self.send_error(414)
-                return
-    
-            if not self.parse_request():  # An error code has been sent, just exit
-                return
-    
-            handler = ServerHandler(
-                self.rfile, self.wfile, self.get_stderr(), self.get_environ()
-            )
-            handler.request_handler = self      # backpointer for logging
-            handler.run(self.server.get_app())
-    
-    
-    def run(addr, port, application, ipv6=False, threading=False):
-        server_address = (addr, port)
-        http_cls = type(str('WSGIServer'), (socketserver.ThreadingMixIn, WSGIServer), {})
-        httpd = http_cls(server_address, WSGIRequestHandler)
-        httpd.set_app(application)
-        httpd.serve_forever()
-```
-
-这里对这个 wsgi 服务器稍做解释， 首先通过元类编程，将 WSGIServer 扩展成为一个多线程处理的服务器， 
-然后指定请求处理类 WSGIRequestHandler， 这个请求处理类会委托 application 来处理请求， application 必须是满足 wsgi 协议的， 即
-它必须接受两个位置参数，习惯的叫它们 environ 和 start_response, 这里的命名是可以随便取，只是按照惯例这么取名的，根据 wsgi 协议， 
-服务器或网关必须用到这两个位置参数， environ 是一个字典对象， 它包含一些特定的 wsgi 协议所需的变量，也可以包含一些服务器的相关变量。
-而 start_response 参数是一个可调用者， 它接受两个必要的位置参数和一个可选参数， 习惯性命名为 status, response_headers 和 exc_info
-, status参数是一个形式如 `200 OK` 这样的状态字符串。而 response_headers 参数是一个包含有 `(header_name,header_value)
-参数列表的元组`，用来描述HTTP的响应头. exc_info 不考虑， 另外 wsgi 还规定了 application 必须返回一个可迭代的值。
-如对 application 有疑问， 可以查询 PEP333 来详细了解 wsgi 协议的内容。
-  
-
-定义满足 wsgi 的 application 方法
---------------------------------
-
-按照上面所说， 那么接下来我就要实现这么一个 application ， 以方便我测试服务器以及进行后期的升级改造
-
-首先新建一个 python 文件， 叫它 my_wsgi.py , 在文件中添加一个 application 方法：
+现在将路径独立出来进行配置, 并修改 path_to_response 函数
 
 ```
 
-    def application(environ, start_response):
-        start_response('200 OK', [('content-type', 'text/html')])
-        return [b'Hello World! ']
-        
-```
-
-然后我在 run_server.py 中测试一下，加入如下代码:
-
-```
-
-    if __name__ == '__main__':
-        import sys
-        sys.path.insert(0, r'D:\learn_django_urls')
-        from learn_django_urls.my_wsgi import application
-        run('127.0.0.1', 8003, application)
-        
-```
-
-我将当前项目加入到路径加入到 PYTHONPATH 中， 然后我在 8003 端口启动服务，测试一下
-
-```
-    curl -G  http://127.0.0.1:8003
-```
-
-返回了 Hello World!
-
-想象一下现在我的 application 是固定的， 我想要根据请求的 path 不同，然后返回的内容不同， 这就是 django 的 url 实现的开始:
-根据 wsgi 协议， 知道 path 是存放在 environ 的 PATH_INFO 当中， 它是要给字符串类型, 修改 application 方法如下:
-
-```
-
-    def application(environ, start_response):
-        path = environ['PATH_INFO']
-        if path == '/':
-            data = [b'root path']
-        elif path == '/path1':
-            data = [b'get path1 information']
-        elif path == '/path2':
-            data = [b'get path2 information']
-        else:
-            data = [b'404 error']
-    
-        if data == [b'404 error']:
-            status = '404 PATH NOT FOUND ERROR'
-        else:
-            status = '200 OK'
-    
-        start_response(status, [('content-type', 'text/html')])
-    
-        return data
-  
-```
-
-测试结果如下:
-
-```
-
-    curl -G http://127.0.0.1:8003
-        root path
-    curl -G http://127.0.0.1:8003/path1
-        get path1 information
-    curl -G http://127.0.0.1:8003/path2
-        get path2 information
-    curl -G http://127.0.0.1:8003/invalid_path
-        404 error
-
-```
-
-
-增加 HttpResponse
---------------------------------
-
-
-显然我的这个 application 太不合情理了， 虽然返回一个 iterator 数据， 但它不够灵活， 应该让返回的数据决定它的状态和要返回的 http
-头部信息才对， 而且编码处理也应该由响应自己完成才对， 总之我要一个响应对应一个响应对象，并且这个对象是可迭代的，而且可以指定内容，
-状态码，编码，头部，cookie信息等，那么我主要考察的是 url 的实现， 因此我也可以去拿 django HttpResponse 稍作修改就好， 
-我把跟 settings 有关的内容固定下来, 在 my_wsgi 文件中添加如下代码:
-
-```
-
-    import datetime
-    import sys
-    import re
-    
-    from django.utils import six,  timezone
-    from http.client import responses
-    from email.header import Header
-    
-    _charset_from_content_type_re = re.compile(r';\s*charset=(?P<charset>[^\s;]+)', re.I)
-    
-    
-    class HttpResponseBase(six.Iterator):
-        """
-        An HTTP response base class with dictionary-accessed headers.
-    
-        This class doesn't handle content. It should not be used directly.
-        Use the HttpResponse and StreamingHttpResponse subclasses instead.
-        """
-    
-        status_code = 200
-    
-        def __init__(self, content_type=None, status=None, reason=None, charset=None):
-            # _headers is a mapping of the lower-case name to the original case of
-            # the header (required for working with legacy systems) and the header
-            # value. Both the name of the header and its value are ASCII strings.
-            self._headers = {}
-            self._closable_objects = []
-            # This parameter is set by the handler. It's necessary to preserve the
-            # historical behavior of request_finished.
-            self._handler_class = None
-            self.cookies = {}
-            self.closed = False
-            if status is not None:
-                self.status_code = status
-            self._reason_phrase = reason
-            self._charset = charset
-            if content_type is None:
-                content_type = '%s; charset=%s' % ('text/html',
-                                                   self.charset)
-            self['Content-Type'] = content_type
-    
-        @property
-        def reason_phrase(self):
-            if self._reason_phrase is not None:
-                return self._reason_phrase
-            # Leave self._reason_phrase unset in order to use the default
-            # reason phrase for status code.
-            return responses.get(self.status_code, 'Unknown Status Code')
-    
-        @reason_phrase.setter
-        def reason_phrase(self, value):
-            self._reason_phrase = value
-    
-        @property
-        def charset(self):
-            if self._charset is not None:
-                return self._charset
-            content_type = self.get('Content-Type', '')
-            matched = _charset_from_content_type_re.search(content_type)
-            if matched:
-                # Extract the charset and strip its double quotes
-                return matched.group('charset').replace('"', '')
-            return 'utf-8'
-    
-        @charset.setter
-        def charset(self, value):
-            self._charset = value
-    
-        def serialize_headers(self):
-            """HTTP headers as a bytestring."""
-            def to_bytes(val, encoding):
-                return val if isinstance(val, bytes) else val.encode(encoding)
-    
-            headers = [
-                (b': '.join([to_bytes(key, 'ascii'), to_bytes(value, 'latin-1')]))
-                for key, value in self._headers.values()
-            ]
-            return b'\r\n'.join(headers)
-    
-        if six.PY3:
-            __bytes__ = serialize_headers
-        else:
-            __str__ = serialize_headers
-    
-        def _convert_to_charset(self, value, charset, mime_encode=False):
-            """Converts headers key/value to ascii/latin-1 native strings.
-    
-            `charset` must be 'ascii' or 'latin-1'. If `mime_encode` is True and
-            `value` can't be represented in the given charset, MIME-encoding
-            is applied.
-            """
-            if not isinstance(value, (bytes, six.text_type)):
-                value = str(value)
-            if ((isinstance(value, bytes) and (b'\n' in value or b'\r' in value)) or
-                    isinstance(value, six.text_type) and ('\n' in value or '\r' in value)):
-                raise ValueError("Header values can't contain newlines (got %r)" % value)
-            try:
-                if six.PY3:
-                    if isinstance(value, str):
-                        # Ensure string is valid in given charset
-                        value.encode(charset)
-                    else:
-                        # Convert bytestring using given charset
-                        value = value.decode(charset)
-                else:
-                    if isinstance(value, str):
-                        # Ensure string is valid in given charset
-                        value.decode(charset)
-                    else:
-                        # Convert unicode string to given charset
-                        value = value.encode(charset)
-            except UnicodeError as e:
-                if mime_encode:
-                    # Wrapping in str() is a workaround for #12422 under Python 2.
-                    value = str(Header(value, 'utf-8', maxlinelen=sys.maxsize).encode())
-                else:
-                    e.reason += ', HTTP response headers must be in %s format' % charset
-                    raise
-            return value
-    
-        def __setitem__(self, header, value):
-            header = self._convert_to_charset(header, 'ascii')
-            value = self._convert_to_charset(value, 'latin-1', mime_encode=True)
-            self._headers[header.lower()] = (header, value)
-    
-        def __delitem__(self, header):
-            try:
-                del self._headers[header.lower()]
-            except KeyError:
-                pass
-    
-        def __getitem__(self, header):
-            return self._headers[header.lower()][1]
-    
-        def has_header(self, header):
-            """Case-insensitive check for a header."""
-            return header.lower() in self._headers
-    
-        __contains__ = has_header
-    
-        def items(self):
-            return self._headers.values()
-    
-        def get(self, header, alternate=None):
-            return self._headers.get(header.lower(), (None, alternate))[1]
-    
-        def set_cookie(self, key, value='', max_age=None, expires=None, path='/',
-                       domain=None, secure=False, httponly=False):
-            """
-            Sets a cookie.
-    
-            ``expires`` can be:
-            - a string in the correct format,
-            - a naive ``datetime.datetime`` object in UTC,
-            - an aware ``datetime.datetime`` object in any time zone.
-            If it is a ``datetime.datetime`` object then ``max_age`` will be calculated.
-    
-            """
-            value = str(value)
-            self.cookies[key] = value
-            if expires is not None:
-                if isinstance(expires, datetime.datetime):
-                    if timezone.is_aware(expires):
-                        expires = timezone.make_naive(expires, timezone.utc)
-                    delta = expires - expires.utcnow()
-                    # Add one second so the date matches exactly (a fraction of
-                    # time gets lost between converting to a timedelta and
-                    # then the date string).
-                    delta = delta + datetime.timedelta(seconds=1)
-                    # Just set max_age - the max_age logic will set expires.
-                    expires = None
-                    max_age = max(0, delta.days * 86400 + delta.seconds)
-                else:
-                    self.cookies[key]['expires'] = expires
-            if max_age is not None:
-                self.cookies[key]['max-age'] = max_age
-                # IE requires expires, so set it if hasn't been already.
-                if not expires:
-                    # self.cookies[key]['expires'] = cookie_date(time.time() + max_age)
-                    pass
-    
-            if path is not None:
-                self.cookies[key]['path'] = path
-            if domain is not None:
-                self.cookies[key]['domain'] = domain
-            if secure:
-                self.cookies[key]['secure'] = True
-            if httponly:
-                self.cookies[key]['httponly'] = True
-    
-        def setdefault(self, key, value):
-            """Sets a header unless it has already been set."""
-            if key not in self:
-                self[key] = value
-    
-        def set_signed_cookie(self, key, value, salt='', **kwargs):
-            # value = signing.get_cookie_signer(salt=key + salt).sign(value)
-            return self.set_cookie(key, value, **kwargs)
-    
-        def delete_cookie(self, key, path='/', domain=None):
-            self.set_cookie(key, max_age=0, path=path, domain=domain,
-                            expires='Thu, 01-Jan-1970 00:00:00 GMT')
-    
-        # Common methods used by subclasses
-    
-        def make_bytes(self, value):
-            """Turn a value into a bytestring encoded in the output charset."""
-            # Per PEP 3333, this response body must be bytes. To avoid returning
-            # an instance of a subclass, this function returns `bytes(value)`.
-            # This doesn't make a copy when `value` already contains bytes.
-    
-            # Handle string types -- we can't rely on force_bytes here because:
-            # - under Python 3 it attempts str conversion first
-            # - when self._charset != 'utf-8' it re-encodes the content
-            if isinstance(value, bytes):
-                return bytes(value)
-            if isinstance(value, six.text_type):
-                return bytes(value.encode(self.charset))
-    
-            # Handle non-string types (#16494)
-            return bytes(value, self.charset)
-    
-        # These methods partially implement the file-like object interface.
-        # See http://docs.python.org/lib/bltin-file-objects.html
-    
-        # The WSGI server must call this method upon completion of the request.
-        # See http://blog.dscpl.com.au/2012/10/obligations-for-calling-close-on.html
-        def close(self):
-            for closable in self._closable_objects:
-                try:
-                    closable.close()
-                except Exception:
-                    pass
-            self.closed = True
-            # signals.request_finished.send(sender=self._handler_class)
-    
-        def write(self, content):
-            raise IOError("This %s instance is not writable" % self.__class__.__name__)
-    
-        def flush(self):
-            pass
-    
-        def tell(self):
-            raise IOError("This %s instance cannot tell its position" % self.__class__.__name__)
-    
-        # These methods partially implement a stream-like object interface.
-        # See https://docs.python.org/library/io.html#io.IOBase
-    
-        def writable(self):
-            return False
-    
-        def writelines(self, lines):
-            raise IOError("This %s instance is not writable" % self.__class__.__name__)
-    
-    
-    class HttpResponse(HttpResponseBase):
-        """
-        An HTTP response class with a string as content.
-    
-        This content that can be read, appended to or replaced.
-        """
-    
-        streaming = False
-    
-        def __init__(self, content='', *args, **kwargs):
-            super(HttpResponse, self).__init__(*args, **kwargs)
-            # Content is a bytestring. See the `content` property methods.
-            self.content = content
-    
-        def serialize(self):
-            """Full HTTP message, including headers, as a bytestring."""
-            return self.serialize_headers() + b'\r\n\r\n' + self.content
-    
-        if six.PY3:
-            __bytes__ = serialize
-        else:
-            __str__ = serialize
-    
-        @property
-        def content(self):
-            return b''.join(self._container)
-    
-        @content.setter
-        def content(self, value):
-            # Consume iterators upon assignment to allow repeated iteration.
-            if hasattr(value, '__iter__') and not isinstance(value, (bytes, six.string_types)):
-                if hasattr(value, 'close'):
-                    self._closable_objects.append(value)
-                value = b''.join(self.make_bytes(chunk) for chunk in value)
-            else:
-                value = self.make_bytes(value)
-            # Create a list of properly encoded bytestrings to support write().
-            self._container = [value]
-    
-        def __iter__(self):
-            return iter(self._container)
-    
-        def write(self, content):
-            self._container.append(self.make_bytes(content))
-    
-        def tell(self):
-            return len(self.content)
-    
-        def getvalue(self):
-            return self.content
-    
-        def writable(self):
-            return True
-    
-        def writelines(self, lines):
-            for line in lines:
-                self.write(line)
-                
-    class HttpResponseNotFound(HttpResponse):
-        status_code = 404
-
-```
-
-
-django 的 HttpResponse 做为 http 的响应体基类， 其他针对于不同的状态码定义了不同的响应类它们都是 HttpResponse 的子类，这样
-做的好处就是见名知意， 像 django 中的异常也是这么来做的， 这符合 python 哲学，HttpResponseNotFound 针对于找不到这样请求路径时
-使用。 那么接下来就可以修改 application 的代码的返回为响应体了。
-
-```
-
-    def application(environ, start_response):
-        response = path_to_response(environ)
-        status = '%s %s' % (response.status_code, response.reason_phrase)
-        response_headers = [(str(k), str(v)) for k, v in response.items()]
-        for c in response.cookies.values():
-            response_headers.append((str('Set-Cookie'), str(c.output(header=''))))
-        start_response(status, response_headers)
-        return response
-    
+    url_patterns = [
+        ('^/$', index_view),
+        ('^/path([1,2])$', path_view)
+    ]
     
     def path_to_response(environ):
-        path = environ['PATH_INFO']
-        path_not_found = False
-        data = ''
-        if path == '/':
-            data = '<h1>root path</h1>'
-        elif path == '/path1':
-            data = '<p>get path1 information</p>'
-        elif path == '/path2':
-            data = '<p>get path2 information</p>'
-        else:
-            path_not_found = True
-        if path_not_found:
-            response = HttpResponseNotFound('<p style="color:red;">path not found error</p>')
-        else:
-            response = HttpResponse(data)
-        return response
+
+    path = environ['PATH_INFO']
+
+    for pattern, view in url_patterns:
+        compiled_regex = re.compile(pattern, re.UNICODE)
+        match = compiled_regex.search(path)
+        if match:
+            kwargs = match.groupdict()
+            args = () if kwargs else match.groups()
+            return view(environ, *args, **kwargs)
+
+    return HttpResponseNotFound('<p style="color:red;">path not found error</p>')
+
+```
+
+现在我继续测试一下， 如果每次都要自己测试一遍的话，比较麻烦， 因此可以加上单元测试，让程序做这个事情
+
+增加单元测试处理
+-----------------
+
+这里使用 pytest , 使用 pip 安装即可
+ 
+创建一个pytest的配置文件 pytest.ini, 配置它去搜索的目录为 tests，以及有两个失败的单元测试之后，就
+停止测试
+
+```
+    [pytest]
+    python_paths = .
+    addopts = --maxfail=2 -rf
+    testpaths = tests
+
+```
+
+为了更好的单元测试，我创建一个 urlsconf.py 然后将配置路径移过去，这样就可以通过 monkey patch的
+形式就可以替换我的配置路径了， 同时重构下目录和文件名，让项目代码独立放到 project, 并且更加符合pep
+8源文件命名（无下划线全小写)的风格.接着把 view 的代码和Response也分别独立放一个文件 views.py 和
+response.py
+
+首先在 tests 的 __init__.py 文件中，将项目加到 PYTHONPATH 中，以便 pytest 可以找到
+
+```
+
+    import sys, os
+    myPath = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, myPath + '/../')
+
+```
+
+创建一个测试文件 test_my_wsgi.py, 加上我的单元测试
+
+```
+    from project import mywsgi
+
+
+    def test_path_to_response(monkeypatch):
+    
+        url_patterns = [
+            ('^/$', lambda version, *args, **kwargs: '<h1>root path test</h1>'),
+            ('^/path([1,2])$', lambda version, *args, **kwargs: '<p>get path{} test information</p>'.format(args[0]))
+        ]
+    
+        monkeypatch.setattr(mywsgi, "url_patterns", url_patterns)
+    
+        assert mywsgi.path_to_response({'PATH_INFO': '/'}) == '<h1>root path test</h1>'
+        assert mywsgi.path_to_response({'PATH_INFO': '/'}) != '<h1>root path tes</h1>'
+        assert mywsgi.path_to_response({'PATH_INFO': '/path1'}) == '<p>get path1 test information</p>'
+        assert mywsgi.path_to_response({'PATH_INFO': '/path3'}) == '<p style="color:red;">path not found error</p>'
+
+```
+
+当我使用 py.test 命令执行测试的时候， 测试未通过
+
+>   
+    E        assert <project.response.HttpResponseNotFound object at 0x035A70D0> == '<p style="color:red;">path not found error</p>'
+    E        +  where <project.response.HttpResponseNotFound object at 0x035A70D0> = <function path_to_response at 0x030F1618>({'PATH_INF
+    O': '/path3'})
+    E        +    where <function path_to_response at 0x030F1618> = mywsgi.path_to_response
+
+
+增加程序的健壮性同时重构 404 问题
+--------------------------------
+
+那么这说明， 在路径找不到的时候，它的处理与 正常的 path 的 view 不一致， 这里我应该修改它，使其与
+其他正常 view 一样才行， 按照 django 的设计思想是找不到这样的路径将抛出异常，然后捕获这个异常进行处理， 还有这里的 url 正则表达式不用
+每次请求都进行编译，只要配置好，编译一次就够了， 另外除了路径找不到的问题，还会有其他的问题，比如程序出现异常， 所以采用捕获异常的方式
+可以根据不同的异常，来得到不同的响应。只有正常的情况下才返回 view. 那么修改单元测试为:
+
+```
+    ... ...
+    with pytest.raises(Http404):
+        mywsgi.path_to_response({'PATH_INFO': '/path3'})
+
+```
+
+修改 application 函数为:
+
+```
+
+    try:
+        response = path_to_response(environ)
+    except Http404:
+        response = HttpResponseNotFound('<p style="color:red;">path not found error</p>')
+    except Exception:
+        response = HttpResponseServerError('error occur in server')
+
+```
+
+为 application 增加一个单元测试:
+
+```
+
+    def test_application(monkeypatch):
+
+    def view1(environ):
+        raise ValueError('test')
+
+    def view2(environ):
+        raise Http404
+
+    def start_response(param1, param2):
+        pass
+
+    monkeypatch.setattr(mywsgi, 'path_to_response', view1)
+    assert isinstance(mywsgi.application(None, start_response), HttpResponseServerError)
+
+    monkeypatch.setattr(mywsgi, 'path_to_response', view2)
+    assert isinstance(mywsgi.application(None, start_response), HttpResponseNotFound)
+
+```
+
+注意我这里增加了一个 exceptions.py 模块和一个 HttpResponseServerError 响应, 单元测试了下一切正常。
+
+重构 url 匹配
+--------------
+
+接下来要重构一下， url 匹配这一块代码， 提高匹配性能， 路径判断， 更加优雅的拓展 url 的配置.
+除了上述想要的目标， 还应该检查 url 配置正确性。
+
+首先在配置的时候，加一层壳，用于检查 url 的配置正确性, 如果配置不正确， 增加一个抛出异常
+exceptions.py
+
+```
+
+    class ImproperlyConfigured(Exception):
+        """Django is somehow improperly configured"""
+        pass
+
+```
+
+在这个 url 函数中， 对正则表达式判断和编译，以及 view 是否为函数进行判断
+urlsconf.py
+
+```
+
+    def url(regex: str, view):
+
+        if not regex or not isinstance(regex, str):
+            raise ImproperlyConfigured('{} is empty or invalid'.format(regex))
+        try:
+            re.compile(regex)
+        except re.error as e:
+            raise ImproperlyConfigured('"%s" is not a valid regular expression: %s' % (regex, e))
+    
+        if not callable(view):
+            raise ImproperlyConfigured('URL pattern：{} view is not callable'.format(regex))
+    
+        return RegexURLPattern(regex, view)
     
 ```
 
-在原来的基础上， 我将返回数据变得更像网页类服务器所返回的数据，在上面加了一些 `html` 标记， 然后稍微的重构了下， 这样 application
-的负担就减轻了， 那我就可以专注于请求路径上面了.
+修改 path_to_response 函数， 来满足这个 url 函数
+
+```
+
+    def path_to_response(environ):
+
+        path = environ['PATH_INFO']
+    
+        for pattern_object in url_patterns:
+            # compiled_regex = re.compile(pattern, re.UNICODE)
+            match = pattern_object.regex.search(path)
+            if match:
+                kwargs = match.groupdict()
+                args = () if kwargs else match.groups()
+                return pattern_object.callback(environ, *args, **kwargs)
+    
+        raise Http404
+    
+```
+
+下面是添加的 RegexURLPattern 类， 使用描述符将编译的 regex 属性缓存到属性列表中:
+
+```
+
+    class RegexURLPattern(object):
+
+        def __init__(self, regex, callback):
+            self._regex = regex
+            self.callback = callback
+    
+        @cached_property
+        def regex(self):
+            return re.compile(self._regex, re.UNICODE)
+    
+        def __repr__(self):
+            return 'RegexURLPattern instance regex is: {}, callback name is: {}'.format(self._regex, self.callback.__name__)
+    
+        def __str__(self):
+            return self.__repr__()
+        
+```
+
+然后我加上一个单元测试函数来测试它:
+
+```
+
+    from project.urlsconf import url
+
+    def test_url_function(monkeypatch):
+    
+        def temp_func(version, *args, **kwargs):
+            return '<h1>root path test</h1>'
+    
+        with pytest.raises(ImproperlyConfigured):
+            url(None, temp_func)
+    
+        with pytest.raises(ImproperlyConfigured):
+            url(r'^d({1,-1}$', temp_func)
+    
+        with pytest.raises(ImproperlyConfigured):
+            url([1, 2, 3], temp_func)
+    
+        with pytest.raises(ImproperlyConfigured):
+            url('^/path([1,2])$', None)
+
+```
+
+测试没有问题， 查看代码的时候发现， regex 还是进行了两次编译， 判断时编译了一次， 还有第一次使用时编译了一次,
+因此将编译检测其实可以放一块， 判断推后就行了, 去掉前面单元测试中不合法的正则表达式的检查，然后增加一个 RegexURLPattern
+类的单元测试， 同时移除 url 函数中正则表达式不合法的检测。
+
+```
+
+    from project.urlsconf import RegexURLPattern
+
+
+    def test_regex_url_pattern_class():
+    
+        with pytest.raises(ImproperlyConfigured):
+            RegexURLPattern(r'^d({1,-1}$', _temp_func).regex
+
+
+```
+
+注， django 目前来说，还支持字符串形式的 view，这种方式通过分解字符串来加载函数， 但是 django 明确在将来将会淘汰这种方法， 因此
+大致的 url 的一个实现过程由个初步的了解了。
 
 结束语
--------
+----------
 
-那现在一切都以准备就绪了， 那接下来要关注的就是针对于不同的路径来生成内容了， 在访问服务器的时候， 除了不一样的路径， 还有
-url 参数, 查询字符串等，它们也是 http 定位资源的一部分， 因此也要将它们考虑进来， 另外就算是路径，一个网站的路径成千上万，
-不可能都if， else来实现吧， 那好用字典吧，将路径与返回的数据一一对应起来不就行了嘛， 这样做应该没有问题的， 但很多时候它会
-变得不方便， 比如一个路径 /path/id , 这个id 从 1 到 100 都是合法的，那是不是要写个方法，将它逐一添加到这个路径字典中了，
-如果 1 到 100 的路径是其他一样的数据了， 显然这样做冗余太大了， 并且针对于不同的路径可能要编写不同的方法来将这些路径添加到
-这个字典中来， 因此就有了正则表达式来判断路径对应返回的数据的念头了， 这也正式 django 框架采用的方法，它足够灵活，以及足够的性能。
-
+通过 一个正则表达式对应一个处理函数的方式， 来将具体路径映射到具体的处理函数中去，在路径匹配的时候，不但要知道这个路径具体怎么处理，
+还要提取路径中的信息，作为处理函数的条件或者数据，因此需要在正则表达式中进行分组处理， 接下来为了使这种映射关系配置的灵活性，将其
+作为独立配置以列表的形式独立了出来， 在匹配的时候是通过扫描列表的方式来匹配的， 这就意味着将使用频繁的路径放在列表的前面有利于提高
+访问性能； 这种配置模式是要经过检查处理的，python 它不像 java 那样的静态语言，因此动态语言的灵活性有的时候也会带来一些困扰， 虽然
+在接下来的 python 3 版本中，加了注解，但以防万一很多时候参数的检查还是得自己来写，这里加了一个配置检测的异常 ImproperlyConfigured
+它应该是对应所有配置发生错误应该抛出的异常； 为了达到最好的性能， django 只在第一次匹配路径时进行正则表达式的编译处理，因此第一次
+请求可能响应时间会相对慢一些。
 
 
 
