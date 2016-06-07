@@ -21,19 +21,31 @@ def application(environ, start_response):
     start_response(status, response_headers)
     return response
 
+# first_pattern = re.compile(r'/')
 
 def path_to_response(environ):
 
     path = environ['PATH_INFO']
+    # match = path[1:]
 
+    new_path = path[1:]
+    # callback = None
+    # args = None
+    # kwargs = None
     for pattern_object in url_patterns:
         # compiled_regex = re.compile(pattern, re.UNICODE)
-        match = pattern_object.regex.search(path)
-        if match:
-            kwargs = match.groupdict()
-            args = () if kwargs else match.groups()
-            return pattern_object.callback(environ, *args, **kwargs)
+        # match = pattern_object.regex.search(path)
+        # if match:
+        #     kwargs = match.groupdict()
+        #     args = () if kwargs else match.groups()
+        #     return pattern_object.callback(environ, *args, **kwargs)
+        obj = pattern_object.resolve(new_path)
+        if obj:
+            callback, args, kwargs = obj
+            return callback(environ, *args, **kwargs)
 
     raise Http404
+
+
 
 
